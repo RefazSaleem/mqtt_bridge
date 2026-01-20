@@ -1,0 +1,3 @@
+bed_ac_temp {"Protocol":"NEC","Bits":32,"Data":"0xAAA112"} ir/ac2/cmnd/IRSend 18 {"IRSend":"Done"} ir/ac2/RESULT 18
+bed_ac_temp {"Protocol":"NEC","Bits":32,"Data":"0xAAA113"} ir/ac2/cmnd/IRSend 19 {"IRSend":"Done"} ir/ac2/RESULT 19
+bed_ac_temp {"Protocol":"NEC","Bits":32,"Data":"0xAAA114"} ir/ac2/cmnd/IRSend 20 {"IRSend":"Done"} ir/ac2/RESULT 20
