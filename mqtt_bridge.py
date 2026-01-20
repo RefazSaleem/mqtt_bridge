@@ -8,17 +8,19 @@ import logging
 import logging.handlers
 import threading
 import configparser
+from collections import deque
+import uuid
 
 # Default configuration
 DEFAULT_CONFIG = {
     'BROKER': 'localhost',
-    'PORT': '18423',
+    'PORT': '1883',
     'MQTT_USER': 'mqtt',
-    'MQTT_PASS': 'Error507',
-    'CONFIG_DIR': './lib',
+    'MQTT_PASS': 'user',
+    'CONFIG_DIR': './library',
     'RECONNECT_DELAY': '5',
     'LOG_FILE': './mqtt_bridge.log',
-    'LOG_MAX_SIZE': '10485760',  # 10 MB
+    'LOG_MAX_SIZE': '10485760',
     'LOG_BACKUP_COUNT': '5',
     'LOG_LEVEL': 'INFO'
 }
@@ -26,7 +28,6 @@ DEFAULT_CONFIG = {
 CONFIG_FILE = 'mqtt_bridge.conf'
 
 def load_config():
-    """Load configuration from file or use defaults"""
     config = configparser.ConfigParser()
     config['DEFAULT'] = DEFAULT_CONFIG
     
@@ -38,7 +39,6 @@ def load_config():
             logging.error(f"Failed to read config file: {e}")
     else:
         logging.warning(f"Config file {CONFIG_FILE} not found, using defaults")
-        # Create default config file
         try:
             with open(CONFIG_FILE, 'w') as f:
                 for key, value in DEFAULT_CONFIG.items():
@@ -50,10 +50,8 @@ def load_config():
     return config['DEFAULT']
 
 def setup_logging(config):
-    """Setup logging with rotation"""
     log_level = getattr(logging, config['LOG_LEVEL'].upper(), logging.INFO)
     
-    # Create rotating file handler
     file_handler = logging.handlers.RotatingFileHandler(
         filename=config['LOG_FILE'],
         maxBytes=int(config['LOG_MAX_SIZE']),
@@ -61,15 +59,12 @@ def setup_logging(config):
         encoding='utf-8'
     )
     
-    # Console handler
     console_handler = logging.StreamHandler()
     
-    # Formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
     
-    # Setup root logger
     logger = logging.getLogger()
     logger.setLevel(log_level)
     logger.addHandler(file_handler)
@@ -83,16 +78,14 @@ mqtt_client = None
 is_connected = False
 startup_time = None
 config = None
-logger = None
+pending_commands = {}  # Track sent commands: {status_topic: {command_topic, input_val, output}}
 
 def log_message(direction, topic, payload):
-    """Log MQTT messages with direction indicator"""
     direction_symbol = "→" if direction == "out" else "←"
     truncated_payload = payload[:100] + "..." if len(payload) > 100 else payload
     logging.info(f"{direction_symbol} {topic} = {truncated_payload}")
 
 def load_library():
-    """Load IR command library from directory"""
     global IR_LIBRARY
     
     IR_LIBRARY = {}
@@ -128,11 +121,12 @@ def load_library():
                             "cmd_topic": cmd_topic,
                             "output": output_val,
                             "status_topic": status_topic,
-                            "status_msg": status_msg
+                            "status_msg": status_msg,
+                            "command_name": name
                         }
                         
                         command_count += 1
-                        logging.debug(f"Loaded: {command_topic}[{input_val}] → {cmd_topic}")
+                        logging.debug(f"Loaded: {command_topic}[{input_val}] → {output_val}")
                     except Exception as e:
                         logging.warning(f"Parse error {file_path}:{line_num}: {e}")
             
@@ -143,7 +137,6 @@ def load_library():
     logging.info(f"Loaded {command_count} commands from {file_count} files in {len(IR_LIBRARY)} topics")
 
 def reconnect():
-    """Attempt to reconnect to MQTT broker"""
     global is_connected
     
     reconnect_delay = int(config['RECONNECT_DELAY'])
@@ -194,6 +187,8 @@ def on_disconnect(client, userdata, rc):
         logging.info("Disconnected normally")
 
 def on_message(client, userdata, msg):
+    global pending_commands
+    
     # Ignore messages received during first 3 seconds after startup
     if startup_time and (time.time() - startup_time) < 3:
         logging.debug(f"Ignoring message on startup: {msg.topic}")
@@ -204,12 +199,14 @@ def on_message(client, userdata, msg):
     
     log_message("in", topic, payload)
     
+    # Handle commands from library topics
     if topic in IR_LIBRARY:
         input_val = payload.strip()
         
         if input_val in IR_LIBRARY[topic]:
             entry = IR_LIBRARY[topic][input_val]
             
+            # Send IR command
             try:
                 payload_json = json.loads(entry["payload"])
                 send_payload = json.dumps(payload_json)
@@ -218,31 +215,46 @@ def on_message(client, userdata, msg):
             
             client.publish(entry["cmd_topic"], send_payload)
             log_message("out", entry["cmd_topic"], send_payload)
+            
+            # Track this command as pending
+            pending_commands[entry["status_topic"]] = {
+                "command_topic": topic,
+                "input_val": input_val,
+                "output_val": entry["output"],
+                "timestamp": time.time()
+            }
+            logging.debug(f"Tracked pending command: {entry['status_topic']} → {entry['output']}")
     
-    else:
-        for cmd_topic, commands in IR_LIBRARY.items():
-            for input_val, entry in commands.items():
-                if entry["status_topic"] == topic:
-                    payload_str = payload
-                    status_msg = entry["status_msg"]
-                    
-                    try:
-                        expected_json = json.loads(status_msg)
-                        payload_json = json.loads(payload_str)
-                        
-                        if all(payload_json.get(k) == v for k, v in expected_json.items()):
-                            status_topic = f"{cmd_topic}/status"
-                            client.publish(status_topic, entry["output"], retain=True)
-                            log_message("out", status_topic, entry["output"])
-                    except:
-                        if status_msg in payload_str:
-                            status_topic = f"{cmd_topic}/status"
-                            client.publish(status_topic, entry["output"], retain=True)
-                            log_message("out", status_topic, entry["output"])
-                    return
+    # Handle status/responses from IR devices
+    elif topic in pending_commands:
+        pending_data = pending_commands.pop(topic, None)
+        if not pending_data:
+            return
+        
+        payload_str = payload
+        
+        # Check if response matches expected status message
+        entry = IR_LIBRARY[pending_data["command_topic"]][pending_data["input_val"]]
+        status_msg = entry["status_msg"]
+        
+        try:
+            expected_json = json.loads(status_msg)
+            payload_json = json.loads(payload_str)
+            
+            if all(payload_json.get(k) == v for k, v in expected_json.items()):
+                # Publish the CORRECT output based on the input that was sent
+                status_topic = f"{pending_data['command_topic']}/status"
+                client.publish(status_topic, pending_data["output_val"], retain=True)
+                log_message("out", status_topic, pending_data["output_val"])
+        except:
+            if status_msg in payload_str:
+                status_topic = f"{pending_data['command_topic']}/status"
+                client.publish(status_topic, pending_data["output_val"], retain=True)
+                log_message("out", status_topic, pending_data["output_val"])
+        
+        logging.debug(f"Cleared pending command for {topic}")
 
 def initialize_mqtt():
-    """Initialize MQTT client"""
     global mqtt_client
     
     mqtt_client = mqtt.Client()
@@ -258,6 +270,21 @@ def initialize_mqtt():
     
     return mqtt_client
 
+def cleanup_pending_commands():
+    """Clean up old pending commands"""
+    global pending_commands
+    
+    current_time = time.time()
+    to_remove = []
+    
+    for status_topic, data in pending_commands.items():
+        if current_time - data["timestamp"] > 30:  # 30 second timeout
+            to_remove.append(status_topic)
+            logging.warning(f"Timeout for pending command: {data['command_topic']} = {data['input_val']}")
+    
+    for topic in to_remove:
+        pending_commands.pop(topic, None)
+
 def main():
     global config
     
@@ -268,7 +295,7 @@ def main():
     setup_logging(config)
     
     logging.info("=" * 60)
-    logging.info("MQTT-IR Bridge starting...")
+    logging.info("MQTT-IR Bridge with Command Tracking")
     logging.info(f"Log file: {config['LOG_FILE']} (max {int(config['LOG_MAX_SIZE'])/1048576:.1f} MB)")
     logging.info("=" * 60)
     
@@ -286,9 +313,10 @@ def main():
         client.connect(config['BROKER'], int(config['PORT']), 60)
         client.loop_start()
         
-        # Main loop
+        # Main loop with periodic cleanup
         while True:
             time.sleep(1)
+            cleanup_pending_commands()
             
     except KeyboardInterrupt:
         logging.info("Shutdown requested by user")
