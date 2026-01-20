@@ -1,0 +1,3 @@
+# Format: name, payload, cmd_topic, input, status_msg, status_topic, output
+liv_tv_power {"Protocol":"Samsung","Bits":16,"Data":"0xC0564"} ir/tv1/cmnd/IRSend on {"IRSend":"Done"} ir/tv1/RESULT on
+liv_tv_power {"Protocol":"Samsung","Bits":16,"Data":"0xC0A64"} ir/tv1/cmnd/IRSend off {"IRSend":"Done"} ir/tv1/RESULT off
