@@ -25,7 +25,7 @@ DEFAULT_CONFIG = {
     'LOG_LEVEL': 'INFO'
 }
 
-CONFIG_FILE = 'mqtt-bridge.conf'
+CONFIG_FILE = 'mqtt_bridge.conf'
 
 def load_config():
     config = configparser.ConfigParser()
